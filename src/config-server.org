@@ -1,0 +1,435 @@
+ #+TITLE:  Configuration Server
+#+PROPERTY: session *scratch*
+#+PROPERTY: results output
+#+PROPERTY: exports code
+#+SETUPFILE: org-templates/level-0.org
+#+options: ^:nil
+ 
+* Introduction
+  In this documentation, we call config-server as ansible server,
+  configuration server and also node. 
+  
+  This document describes the requirements, design and implementation of
+  the configuration server.
+  
+  This configuration server plays a vital role in the cluster to
+  complete the infrastructure.  Since configuration server configures
+  all other nodes in the cluster and configures itself as well,
+  through multiple roles and tasks.  A role is a specific set of
+  configurations.
+
+  it contains all the ansible-scripts to bring up the other nodes. The
+  purpose of this server is to avoid manual configuration of nodes by
+  team members. The mechanism ansible provides to configure other nodes
+  is via ssh.
+ 
+  The configuration server will be able to ssh to other servers and lab
+  instances/containers using *key based authentication only* since
+  public key of configuration server will be placed in all other
+  servers/nodes,instances/containers and itself also. Password based
+  authentication is not allowed to this node
+  
+
+** COMMENT Only from management ip machines, we will be able ssh to root account
+of configuration server. Password based authentication is not allowed
+to root user, only key based authentication is allowed from specific
+ip machines.  
+
+- Note  ::  In future we can have non-root(normal) user to
+            ssh to configuration server only from management ip
+            machines.
+
+* Requirements
+ The requirements of the config-server which differ from the generic
+ requirements(specified in common-role) are mentioned here.
+
+** Functional Requirements
+   1. Configuration server will configure all the nodes in the cluster
+      including itself and ensures that the configuration is
+      consistent.
+   2. Configuration server has only one `root' user.
+   3. Only authorized VLEAD members can login as 'root' user from IIIT
+      IP range or management ip machines using key based
+      authentication only.
+
+** Security Requirements
+   The Configuration server accepts incoming connections on port 22
+   *only* from IIIT IP range or management ip machines.
+* Design
+  The following network diagram represents how the configuration
+  server is connecting to other nodes such as reverse proxy, DNS,
+  router etc.
+
+  #+CAPTION:  Configuration Server Design Diagram
+  #+LABEL:  fig-config-diagram
+  [[./diagrams/config-server-network-diagram.png]]
+   
+  Configuration server is one of the many other nodes in the cluster.
+  Only IIIT IP range and management ip machines are allowed to ssh to
+  root account of the configuration server.
+
+  The design of the firewall rules ensures that this server is
+  accessible only via port 22.  
+
+  SSH access to the node is allowed only via *key-based
+  authentication*. Password based authentication is not allowed to the
+  root user. SSH configuration, fail2ban and locking root user
+  password are taken care by common role. For more tasks which are
+  done by common role to the node are described in [[./common.org][common role]].
+  
+  The Configuration server can be reached via ICMP (ping) requests.
+  Public key of the configuration server will be placed in every
+  instance/container. So the configuration server will be able to
+  configure all other nodes, instances/containers and as well as
+  itself by running the ansible scripts. These ansible scripts are
+  described and implemented at the [[Implementation][implementation]] section.
+
+** System Configuration files Summary
+
+The following table gives the information about services and their
+configuration files. Other configuration files are updated in common role.
+|-----------+-----------------------------------+---------------------------|
+| *Service* | *Configuration file*              | *Description*             |
+|-----------+-----------------------------------+---------------------------|
+| firewall  | =/etc/sysconfig/iptables/=        | configuration server Role |
+|-----------+-----------------------------------+---------------------------|
+| IP        | =/etc/sysconfig/network-scripts/= | amazon console            |
+|-----------+-----------------------------------+---------------------------|
+
+#+TBLFM: $2=/etc/sysconfig/network-scripts
+
+* Implementation
+  The implementation of the configuration server is done with the
+  following steps.
+  - Note :: In this implementation, variables are used in various
+            places using "{}". Values of these variables are defined
+            in [[common_vars.org][common_vars role]].
+
+** Structure of the scripts
+   The implementation of this system is in terms of a collection of
+   ansible scripts that configures the machine. The scripts are organized as
+   follows:
+
+#+BEGIN_EXAMPLE
+|-- config_server.yml
+|-- roles
+|   |-- config_server
+|   |   |-- handlers
+|   |   |   `-- main.yml
+|   |   |-- tasks
+|   |   |   |-- main.yml
+|   |   `-- templates
+|   |       `-- iptables
+
+#+END_EXAMPLE
+
+** Firewall rules
+Rules which are specific to configuration server are described [[Firewall rules specific to config_server][below]].
+Description of each firewall rule of this configuration server and
+which are common across all the systems are described in [[.common.org][common role]].
+
+Here =config_server.yml= file configures the configuration server with
+the config_server and all other roles. The other roles are:
+    - [[./common.org][common]]
+    - rsyslog_client
+    - ossec_client
+    - nagios_client
+    - config_server
+
+   =roles/config_server/handlers/main.yml= file defines various
+   handlers which are only executed in case a task notifies
+   them. Handlers are described in details at [[Handlers][handlers]].  The handlers
+   are called only when tasks are called as part of the config_server
+   role. Various templates and files are being used during task
+   execution for creating necessary configuration files.
+
+   =roles/config_server/tasks/main.yml= file consist of various tasks
+   which are needed for setting up config_server. These tasks are
+   implemented and described [[Tasks][here]].
+   
+   =roles/config_server/templates/iptables= template file consist of
+   various firewall rules in order to configure this node securely by
+   running the [[Apply firewall rules to Configuration server][task]]. This template uses various variables and these
+   variable values are defined in common_vars role. This template is
+   created at [[Firewall rules]] section and you can see the description
+   each firewall.
+
+** Tasks
+
+*** Firewall rules
+    Rules which are specific to configuration server are described [[Firewall rules specific to config_server][below]].
+    Description of each firewall rule of this configuration server and
+    which are common across all the systems are described in [[.common.org][common role]].
+
+#+BEGIN_SRC yaml :tangle roles/config_server/templates/iptables
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+#Allow internal process to process communication over loopback interface
+# Accept loopback connections
+-A INPUT -i lo -d 127.0.0.0/8 -j ACCEPT
+#Rate limit new connections to 20 new connections per 30 seconds
+-A INPUT ! -p udp -m state --state NEW -m recent --name new_limit --set
+-A INPUT ! -p udp -m state --state NEW -m recent --name new_limit --rcheck --seconds 30 --hitcount 20 -m limit --limit 2/min -j LOG --log-prefix "new_limit_"
+-A INPUT ! -p udp -m state --state NEW -m recent --name ssh_limit --rcheck --seconds 30 --hitcount 20 -j DROP
+#Accept ICMP ping requests at limited rate
+-A INPUT -p icmp --icmp-type echo-request -m limit --limit 60/minute --limit-burst 120 -j ACCEPT
+-A INPUT -p icmp --icmp-type echo-request -m limit --limit 1/minute --limit-burst 2 -j LOG
+-A INPUT -p icmp --icmp-type echo-request -j DROP
+
+#Allow ongoing connections
+-A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+{% for ip in nagios_server_ips %}
+-A INPUT -p tcp -m tcp -s {{ip}} --dport 22 -j ACCEPT
+{% endfor %}
+#Allow incoming SSH connections from management IPs.  Hopefully fail2ban will take care of bruteforce attacks from management IPs
+{% for item in management_ips  %}
+-A INPUT -m state --state NEW -s {{item}} -p tcp -m tcp --dport 22 -j ACCEPT
+{% endfor %}
+#Allow incoming SSH connections from ansible_server IPs.  Hopefully fail2ban will take care of bruteforce attacks from management IPs
+{% for item in ansible_server_ips  %}
+-A INPUT -m state --state NEW -s {{item}} -p tcp -m tcp --dport 22 -j ACCEPT
+{% endfor %}
+#Allow incoming SSH connections from rsnapshot_server IPs.  Hopefully fail2ban will take care of bruteforce attacks from management IPs
+{% for item in rsnapshot_server_ips  %}
+-A INPUT -m state --state NEW -s {{item}} -p tcp -m tcp --dport 22 -j ACCEPT
+{% endfor %}
+#Allow incoming NRPE queries for nagios from nagios servers
+-A INPUT -m state --state NEW -p tcp -m tcp --dport 5666 -j ACCEPT
+#Log all other "blocked_input_" attempts with rate limiting
+-A INPUT -m state --state NEW -m limit --limit 2/min -j LOG --log-prefix "blocked_input_"
+
+#Reply with proper ICMP error message and reject the connection
+-A INPUT -j REJECT --reject-with icmp-host-prohibited
+#Do not allow any packet to be forwarded
+-A FORWARD -j REJECT --reject-with icmp-host-prohibited
+
+##Output rules
+#Allow outgoing connections to localhost
+-A OUTPUT -s 127.0.0.0/8 -o lo -j ACCEPT
+
+#Allow ongoing connections
+-A OUTPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+#Allow DNS queries
+-A OUTPUT -p udp -m udp --dport 53 -j ACCEPT
+
+#Allow server to send emails.  Required for sending logwatch emails
+-A OUTPUT -p tcp -m tcp --dport 25 -j ACCEPT
+-A OUTPUT -p tcp -m tcp --dport 22 -j ACCEPT
+
+# 80 and 443 OUTPUT is needed for yum update and to install packages
+-A OUTPUT -p tcp -m tcp --dport 80 -j ACCEPT
+-A OUTPUT -p tcp -m tcp --dport 443 -j ACCEPT
+
+#Allow outgoing ping requests
+-A OUTPUT -p icmp --icmp-type echo-request -j ACCEPT
+
+#Allow outgoing connections to rsyslog server
+-A OUTPUT -p udp -m udp --dport 514 -j ACCEPT
+
+#Allow outgoing connections to OSSEC server
+-A OUTPUT -p udp -m udp --dport 1514 -j ACCEPT
+#Log all other "blocked_output_" attempts
+-A OUTPUT -m state --state NEW -m limit --limit 2/min -j LOG --log-prefix "blocked_output_"
+
+#Reply with proper ICMP error message and reject the connection
+-A OUTPUT -j REJECT --reject-with icmp-host-prohibited
+COMMIT
+#+END_SRC
+*** Firewall rules specific to config_server
+**** SSH access from management ips
+     The following firewall rule accepts incoming connections on tcp
+     port 22 only from management ips
+
+#+BEGIN_SRC example
+{% for item in management_ips  %}
+-A INPUT -m state --state NEW -s {{item}} -p tcp -m tcp --dport 22 -j ACCEPT
+{% endfor %}
+#+END_SRC
+**** SSH access from ansible server ips
+     The following firewall rule accepts incoming connections on tcp
+     port 22 only from ansible server ips
+
+#+BEGIN_SRC example
+{% for item in ansible_server_ips %}
+-A INPUT -m state --state NEW -s {{item}} -p tcp -m tcp --dport 22 -j ACCEPT
+{% endfor %}
+#+END_SRC
+*** Installing ansible 
+    Install latest ansible package to setup the configuration server
+    itself and to run the ansible scripts to configure the other nodes
+    in the cluster.
+#+BEGIN_SRC yaml :tangle roles/config_server/tasks/main.yml
+---
+- name: installing ansible
+  yum: name=ansible state=present
+#+END_SRC
+*** Apply firewall rules to Configuration server
+    Firewall rules are applied by following steps:
+    1) Copy the =iptables= template to the configuration server.
+    2) Restart iptables service if the configuration file is modified
+       and apply the configuration.
+
+#+BEGIN_SRC yaml :tangle roles/config_server/tasks/main.yml
+- name: Copy iptables configuration file for configuration server
+  template: src=iptables dest=/etc/sysconfig/iptables mode=600 owner=root group=root
+  notify: restart iptables
+#+END_SRC
+    
+** Handlers
+   Restart the iptables service if configuration file of iptables is
+   modified. These handlers are called only when tasks notifies to
+   start service.
+
+#+BEGIN_SRC yaml :tangle roles/config_server/handlers/main.yaml 
+---
+- name: restart iptables
+  service: name=iptables state=restarted
+#+END_SRC
+
+** Main configuration file
+   The configuration server is managed with all other roles. The
+   implementation is done in terms of defining suitable scripts for
+   each role.  The top level script is =build/code/config_server.yml=
+
+#+BEGIN_SRC yaml :tangle config_server.yaml
+---
+- name: This file configures ansible server
+  hosts: ansible_server
+  remote_user: root
+
+  vars:
+    i_ans: yes
+    host_name: "ansible.{{prefix}}vlabs.ac.in"
+
+  roles:
+    - common
+    - rsyslog_client
+    - ossec_client
+    - nagios_client
+    - rsnapshot_client
+    - config_server
+#+END_SRC
+
+* Test Cases
+** Test case ID :: SSH access using AWS KeyPair
+*** Objective
+    Test to check if SSH is allowed only from IIIT network for the user
+    root and denied from other ips using AWS KeyPair
+*** Apparatus
+    1. Security KeyPair
+    2. A workstation with IIIT ips 
+    3. A workstation with unknown ip 
+    4. Configuration server 
+*** Procedure
+    1. Assume you are inside the IIIT network.
+    2. Create a VM and generate new security KeyPair using AWS console
+    3. Place/copy the KeyPair into ssh-tunnel container.
+    4. Give 400 permission to that KeyPair and
+    5. ssh to config_server from workstation 
+*** Experiments
+**** SSH to the config_server from management ips/ IIIT ips
+    Since configuration server is created using AWS console, KeyPair
+    of this server is generated during creation of the VM. So the
+    private KeyPair is placed in "ssh-tunnel" container on base2. From
+    "ssh-tunnel", only VLEAD members (who have ssh access to
+    ssh-tunnel and sudo permissions to root account) can ssh to
+    configuration server only from IIIT network.  ssh to configuration
+    server using the below command:
+    #+BEGIN_SRC example
+    ssh -i test.pem root@54.56.34.231
+    #+END_SRC
+***** Expected result
+   #+BEGIN_EXAMPLE
+    Last login: ---Details of last login---
+    [root@localhost ~]$
+   #+END_EXAMPLE
+***** Result
+    #+BEGIN_EXAMPLE
+    Last login: Mon Mar 16 02:28:31 2015 from ssh-tunnel.vlabs.ac.in
+    [root@config-server~]$
+    #+END_EXAMPLE
+**** SSH to config_server from workstation with unknown ip
+    Suppose a workstation with unknown ip(other than IIIT network ip)
+    and it has KeyPair, then try ssh to configuration server from that
+    workstation using bellow command:
+
+    #+BEGIN_SRC example 
+    unknown-machine$ ssh -i test.pem root@54.56.34.231
+    #+END_SRC
+***** Result
+    #+BEGIN_SRC example
+    Permission denied....
+    #+END_SRC
+*** Observation 
+    Configuration server is able accept ssh connection only from
+    IIIT/management ips and not from any other machines with unknown
+    ips.
+*** Result 
+    Test is passed. Firewall rules and ssh are configured and applied
+    properly. 
+*** Conclusion
+  Iptables and ssh are configured and applied appropriately. Configuration
+  server is able accept ssh connections only from IIIT/management IPs and
+  not from unknown ips.
+
+** Test case ID :: SSH access using RSA key
+*** Objective
+    Test to check if SSH is allowed only from IIIT network for the user
+    root and denied from other ips using workstation's RSA key
+*** Apparatus
+    1. RSA key
+    2. A workstation1 with IIIT ips 
+    3. A workstation2 with unknown ip 
+    4. Configuration server 
+*** Procedure
+    1. Assume you are inside the IIIT network.
+    2. Create a container and generate ssh key using the following command
+       #+BEGIN_SRC example
+       ssh-keygen -t rsa 
+       #+END_SRC
+       Provide the passphrase if you need. Else press RETURN for no passphrase.
+    3. Place/copy the id_rsa.pub of workstation into configuration
+       server's authorized_keys.
+    4. SSH to configuration server from workstation.
+*** Experiments
+**** SSH to the config_server from IIIT ips/management ips
+    From "workstation1", only VLEAD members (who have ssh access to
+    workstation and sudo permissions to root account) can ssh to
+    configuration server only from IIIT network.  ssh to configuration
+    server using the bellow command:
+    #+BEGIN_SRC example
+    workstation1$ssh root@54.56.34.231
+    #+END_SRC
+***** Expected result
+   #+BEGIN_EXAMPLE
+    Last login: ---Details of last login---
+    [root@localhost ~]$
+   #+END_EXAMPLE
+***** Result
+    #+BEGIN_EXAMPLE
+    Last login: Mon Mar 16 02:28:31 2015 from workstation1
+    [root@config-server~]$
+    #+END_EXAMPLE
+**** SSH to config_server from workstation2 with unknown ip
+    ssh to configuration server from workstation2 which has unknown
+    ip(other than IIIT network ip) using bellow command
+    #+BEGIN_SRC example 
+    workstation2$ ssh root@54.56.34.231
+    #+END_SRC
+***** Result
+    #+BEGIN_SRC example
+    Permission denied....
+    #+END_SRC
+*** Observation 
+    Configuration server is able to accept ssh connection only from
+    IIIT/management ips and not from any other machines with
+    unknown ips.
+*** Result
+    Test is passed. configuration is working fine
+*** Conclusion
+  Iptables are configured and applied appropriately. Configuration
+  server is able accept ssh connections only from IIIT/management IPs
+  and not from unknown ips.
